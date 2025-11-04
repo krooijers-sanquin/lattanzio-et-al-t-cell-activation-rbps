@@ -1,0 +1,587 @@
+# KR 2024/2025
+
+import os
+import sys
+from pathlib import Path
+import pandas as pd
+
+OUTDIR = Path("pipeline_activation")
+
+# Note!
+# for "fun", input column ordering is *not equal* between runs!
+# see, e.g.
+# ```bash
+# 
+# Ôò¡ÔöÇ­ƒƒóÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# Ôò░ÔöÇ ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Reverse"
+#     55  Reverse
+#     53  Reverse
+#     53  Reverse
+#     53  Reverse
+
+# Ôò¡ÔöÇ­ƒƒóÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# Ôò░ÔöÇ ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Potential"
+#     56  Potential contaminant
+#     54  Potential contaminant
+#     54  Potential contaminant
+#     54  Potential contaminant
+# ```
+# Hence the use of xsv
+
+BASE2EVIDENCEFN = {
+    "OOPS_2022": "data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_2022_lumos.evidence_table.txt.gz",
+    "OOPS_2022_FP": "data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_2022_lumos_total_proteome.evidence_table.txt.gz",
+    # "OOPS_2023": "data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_2023_lumos.evidence_table.txt.gz",
+    # "OOPS_2023_FP": "data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_2023_lumos_total_proteome.evidence_table.txt.gz",
+}
+
+# TODO: put in config?
+OMNI_DB = "data/vendor/KR20231013.human_omni_gene.db"
+
+# Read figure mapping
+import pandas as pd
+FIGURE_MAPPING = pd.read_excel("workflow/pipeline_activation.figure_mapping.xlsx")
+FIGURE_MAPPING['ext'] = FIGURE_MAPPING['original'].apply(lambda s: os.path.splitext(s)[1].lstrip(".").lower())
+FIGURE_MAPPING['base'] = FIGURE_MAPPING['original'].apply(lambda s: os.path.basename(os.path.splitext(s)[0]))
+FIGURE_MAPPING['outpath'] = FIGURE_MAPPING.apply(
+    lambda row: OUTDIR / "figures/Fig{figure}.{base}.{ext}".format(
+        figure=row['figure'],
+        base=row['base'],
+        ext=row['ext'],
+    ),
+    axis=1,
+)
+FIGURE_MAPPING['suffix'] = FIGURE_MAPPING['outpath'].apply(lambda p: str(p).replace(str(OUTDIR / "figures" / "Fig"), ""))
+FIGURE_MAPPING['inpath'] = FIGURE_MAPPING.apply(
+    lambda row: OUTDIR / "figures/{base}.{ext}".format(
+        base=row['base'],
+        ext=row['ext'],
+    ),
+    axis=1,
+)
+# DEBUG
+# print(FIGURE_MAPPING.T.to_dict())
+# sys.exit(1)
+
+rule assign_peptides:
+    input:
+        evidence_tables=sorted(BASE2EVIDENCEFN.values()),
+        merge_script="scripts/merge_peptide_tables.py",
+        omni_db=OMNI_DB
+    output:
+        protected("pipeline_activation/raw/peptide_assignments.hgnc.tsv.gz"),
+        protected("pipeline_activation/raw/peptide_assignments.uniprot.tsv.gz"),
+        obs_peptides="pipeline_activation/raw/observed_peptides.txt.gz"
+    # as per the docs: https://snakemake.readthedocs.io/en/stable/snakefiles/rules.html#rule-item-access-helpers
+    params:
+        outdir=subpath(output[0], parent=True)
+    shell:
+        """
+        ls -1 {input.evidence_tables:q} \
+            | parallel -kj1 "\
+                gzip -dc {{}} | xsv fmt -d $'\\t' | xsv search -s 'Potential contaminant' '^$' | xsv search -s 'Reverse' '^$' | xsv select Sequence \
+            " \
+            | uniq | sort | uniq \
+            | gzip -9 \
+        > {output.obs_peptides};
+
+        python {input.merge_script} -d {input.omni_db} \
+            -o {params.outdir} \
+            <(cat <(echo -ne 'Sequence\\tReverse\\tPotential contaminant\\n') <(gzip -dc {output.obs_peptides}));
+        """
+
+rule sum_intensities_peptides_batch:
+    input:
+        evidence_table=lambda wildcards: BASE2EVIDENCEFN[wildcards.outbase],
+        peptide_assignments="pipeline_activation/raw/peptide_assignments.hgnc.tsv.gz",
+        sum_script="scripts/sum_evidence_table_intensities.py",
+    output:
+        "pipeline_activation/raw/{outbase}.hgnc_aggregated.tsv.gz",
+    shell:
+        """
+        python {input.sum_script} {input.peptide_assignments} {input.evidence_table:q} | gzip > {output:q}
+        """
+
+rule create_hgnc_metadata_table:
+    input:
+        omni_db=OMNI_DB,
+        peptide_assignments="pipeline_activation/raw/peptide_assignments.hgnc.tsv.gz",
+        script="scripts/extract_hgnc_metadata.py"
+    output:
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        peptideinfo="pipeline_activation/raw/peptideinfo.tsv.gz"
+    shell:
+        """
+        python {input.script} -d {input.omni_db} -p {output.peptideinfo} -m {output.metadata} {input.peptide_assignments};
+        """
+
+rule prepare_raw_data:
+    input:
+        datafiles=expand("pipeline_activation/raw/{outbase}.hgnc_aggregated.tsv.gz", outbase=sorted(BASE2EVIDENCEFN.keys())),
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/prepare_raw_data.ipynb"
+    output:
+        protected("pipeline_activation/intensity-values.tsv"),
+        protected("pipeline_activation/samplesheet.tsv"),
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule run_model:
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/run_model.ipynb"
+    output:
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/model_matrix_batch.tsv",
+        protected("pipeline_activation/model-output/global_map.h5"),
+        protected("pipeline_activation/model-output/pergene_hdis.h5"),
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule write_excel_files_data_and_model_output:
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        "pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/data_and_coef_dashboard.ipynb",
+    output:
+        "pipeline_activation/raw/observed-data.xlsx",
+        "pipeline_activation/model-output/oops_2022_model_output.xlsx",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule define_gene_lists:
+    input:
+        "data/vendor/41587_2018_1_MOESM4_ESM.xlsx",
+        "data/vendor/41467_2018_6557_MOESM3_ESM.xlsx",
+        "data/vendor/41467_2021_25345_MOESM4_ESM.xlsx",
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/define_gene_lists.ipynb"
+    output:
+        "pipeline_activation/genelists.tsv",
+        "pipeline_activation/figures/rbp-overlap.pdf",
+        "pipeline_activation/figures/venn_RBP_overlap.geneset_GOMF_RNA_BINDING-Queiroz-ours.pdf",
+        "pipeline_activation/figures/venn_RBP_overlap.geneset_GOMF_RNA_BINDING-PerezPerri-ours.pdf",
+        "pipeline_activation/figures/venn_RBP_overlap.geneset_GOMF_RNA_BINDING-Hoefig-ours.pdf",
+        "pipeline_activation/figures/venn_RBP_overlap.Queiroz-PerezPerri-ours.pdf",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule data_overview_coef_exploration:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/data_overview_coef_exploration.ipynb"
+    output:
+        OUTDIR / "figures" / "raw_data_mini_inset.pdf",
+        OUTDIR / "figures" / "model_matrix_mini_inset.pdf",
+        OUTDIR / "figures" / "protein_detection_rate.pdf",
+        OUTDIR / "figures" / "formula_mini_inset.pdf",
+        OUTDIR / "figures" / "coefficients_mini_inset.pdf",
+        OUTDIR / "figures/dataset_overview_log_intensities.pdf",
+        OUTDIR / "figures/predicted_vs_observed_missingness_rate.pdf",
+
+        "pipeline_activation/figures/coef_scatter.activation_vs_Intercept.gs_GOBP_ALPHA_BETA_T_CELL_ACTIVATION.pdf",
+        "pipeline_activation/figures/coef_scatter.activation_vs_Intercept.gs_GOBP_LEUKOCYTE_DIFFERENTIATION.pdf",
+        "pipeline_activation/figures/coef_scatter.activation_vs_Intercept.gs_GOBP_VESICLE_MEDIATED_TRANSPORT_TO_THE_PLASMA_MEMBRANE.pdf",
+        "pipeline_activation/figures/coef_scatter.activation_vs_Intercept.gs_GOMF_NUCLEOTIDYLTRANSFERASE_ACTIVITY.pdf",
+        "pipeline_activation/figures/coef_scatter.act_deltaRBPness_vs_Intercept.gs_GOBP_VESICLE_MEDIATED_TRANSPORT_TO_THE_PLASMA_MEMBRANE.pdf",
+        "pipeline_activation/figures/coef_scatter.act_deltaRBPness_vs_Intercept.gs_GOMF_CARGO_ADAPTOR_ACTIVITY.pdf",
+        "pipeline_activation/figures/coef_scatter.act_deltaRBPness_vs_Intercept.gs_GOMF_NUCLEOTIDYLTRANSFERASE_ACTIVITY.pdf",
+        "pipeline_activation/figures/coef_scatter.act_deltaRBPness_vs_Intercept.selected_genes_indicated.pdf",
+        "pipeline_activation/figures/predicted_vs_observed_log_intensities.pdf",
+        "pipeline_activation/figures/qqplot_log_intensities.pdf",
+        "pipeline_activation/figures/rbpness_vs_cl_lfcs.imputed.pdf",
+        "pipeline_activation/figures/rbpness_vs_cl_lfcs.pdf",
+        "pipeline_activation/figures/rbpness_vs_intercept.gs_GOMF_RNA_BINDING.pdf",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule plot_proteomics_data_single_gene:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_single_gene.py"
+    output:
+        OUTDIR / "figures/single-gene.{query}{libtypestr}.{legend_str}.{coef_str}.pdf"
+    wildcard_constraints:
+        libtypestr=r"(\.OOPS|\.fullproteome|)"
+    params:
+        query="{query}",
+        libtype_arg=lambda wildcards: ("" if wildcards["libtypestr"] == "" else "--only-libtype %s" % wildcards["libtypestr"].lstrip(".")),
+        legend_arg=lambda wildcards: ("--with-legend" if wildcards["legend_str"] == "w_legend" else ""),
+        coef_arg=lambda wildcards: ("--with-coef" if wildcards["coef_str"] == "w_coef" else ""),
+    shell:
+        """
+        python {input.script:q} -m {input.metadata} {params.libtype_arg} {params.legend_arg} {params.coef_arg} -o {output} {params.query}
+        """
+
+rule plot_geneset_dotplot:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_geneset_dotplot.ipynb"
+    output:
+        "pipeline_activation/figures/geneset_matrix_dotplot.pdf",
+        "pipeline_activation/figures/geneset_matrix_full.pdf",
+        "pipeline_activation/figures/geneset_matrix_subset.pdf",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule plot_rbp_coeff:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        OMNI_DB,
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_rbp_coeff.ipynb"
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule plot_coef_scatter_trended_geneset:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_coef_scatter_trended_geneset.py"
+    output:
+        "pipeline_activation/figures/coeffs_scatter.{ycoef}-vs-{xcoef}.{geneset}.svg"
+    params:
+        geneset="{geneset}",
+        xcoef="{xcoef}",
+        ycoef="{ycoef}"
+    shell:
+        """
+        python {input.script:q} -o pipeline_activation/figures/ -x {params.xcoef} -y {params.ycoef} -s {params.geneset}
+        """
+
+rule plot_coef_geneset_kde:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/model_matrix.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        OMNI_DB,
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_coef_geneset_kde.py"
+    output:
+        "pipeline_activation/figures/kde.{coef}.{geneset}.svg"
+    params:
+        geneset="{geneset}",
+        coef="{coef}"
+    shell:
+        """
+        python {input.script:q} -o pipeline_activation/figures/ -c {params.coef} -s {params.geneset}
+        """
+
+rule plot_coef_pairplot:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_model_coeff_correlations.ipynb"
+    output:
+        "pipeline_activation/figures/coef_pairplot.pdf"
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule plot_scatter_dep_activation_logfcs_correlation_with_activation_coef:
+    input:
+        OUTDIR / "samplesheet.tsv",
+        OUTDIR / "intensity-values.tsv",
+        OUTDIR / "model-output/log_intensity_medians.tsv",
+        OUTDIR / "model-output/global_map.h5",
+        OUTDIR / "figures/dep_workflow.diff_expr.activation.tsv",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_correlation_activation_with_dep_logfcs.ipynb"
+    output:
+        OUTDIR / "figures/scatter_correlation_activation_logfcs_dep_and_activation_coef.pdf",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+# Documentation on R markdown rendering:
+# https://stackoverflow.com/a/49908054
+
+rule r_dep_workflow:
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/dep_workflow_effects_cl_in_fullproteome.R"
+    output:
+        "pipeline_activation/figures/plot_cl_effects_fullproteome_and_oops_dep_workflow.pdf",
+        "pipeline_activation/figures/pca_fullproteome_and_oops_dep_workflow.pdf",
+        "pipeline_activation/figures/dep_workflow.diff_expr.activation.tsv",
+    params:
+        scriptfile=subpath(input.script, basename=True),
+    shell:
+        # fun stuff, R in docker with R libraries in a docker volume; hot-updating the ubuntu packages, efficiency be damned ...
+        """
+        docker run \
+            --rm -it \
+            -v `pwd`/pipeline_activation/:/project/data/:ro \
+            -v `pwd`/notebooks/manuscripts/biology-rbps-in-activation/scripts/:/scripts/:ro \
+            -v `pwd`/pipeline_activation/figures/:/project/figures/ \
+            -v r_container_r_libs:/home/rstudio/lib \
+            -e R_LIBS=/home/rstudio/lib/:/usr/local/lib/R/site-library:/usr/local/lib/R/library \
+            --name 'rstudio_tmp_snakemake_{rule}' \
+            --entrypoint /bin/bash \
+            rocker/verse:4.3 \
+            -c "apt update && apt install -y libnetcdf19 && Rscript /scripts/{params.scriptfile}"
+        """
+
+rule r_dep_fullproteome_activation_volcanoplot:
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/dep_workflow_activation_fullproteome_with_volcanoplot.R"
+    output:
+        "pipeline_activation/figures/volcano_dep.fullproteome_act_vs_resting.pdf"
+    params:
+        scriptfile=subpath(input.script, basename=True),
+    shell:
+        # fun stuff, R in docker with R libraries in a docker volume; hot-updating the ubuntu packages, efficiency be damned ...
+        """
+        docker run \
+            --rm -it \
+            -v `pwd`/pipeline_activation/:/project/data/:ro \
+            -v `pwd`/notebooks/manuscripts/biology-rbps-in-activation/scripts/:/scripts/:ro \
+            -v `pwd`/pipeline_activation/figures/:/project/figures/ \
+            -v r_container_r_libs:/home/rstudio/lib \
+            -e R_LIBS=/home/rstudio/lib/:/usr/local/lib/R/site-library:/usr/local/lib/R/library \
+            --name 'rstudio_tmp_snakemake_{rule}' \
+            --entrypoint /bin/bash \
+	    r_verse_with_netcdf:KR20250926 \
+            -c "Rscript /scripts/{params.scriptfile}"
+        """
+
+rule r_limma_rbp:
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        script="scripts/pipeline/limma_rbp.Rmd"
+    output:
+        "pipeline_activation/figures/limma-rbp-volcano.pdf"
+    shell:
+        # fun stuff, R in docker with R libraries in a docker volume ...
+        """
+        docker run \
+            --rm -it \
+            -v `pwd`/data/:/app/data/:ro \
+            -v `pwd`/scripts/pipeline/:/scripts/:ro \
+            -v `pwd`/data/pipeline/rstudio/:/output/ \
+            -v `pwd`/figures/pipeline/:/figures/ \
+            -v r_container_r_libs:/home/rstudio/lib \
+            -e R_LIBS=/home/rstudio/lib/:/usr/local/lib/R/site-library:/usr/local/lib/R/library \
+            --name 'rstudio_tmp_snakemake_limmarbp' \
+            --entrypoint /bin/bash \
+            rocker/verse:4.3 \
+            -c "Rscript -e 'rmarkdown::render(\\"/scripts/limma_rbp.Rmd\\", output_dir=\\"/figures/\\", intermediates_dir=\\"/tmp/\\")'"
+        """
+
+
+rule plot_data_heatmaps:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_clustered_heatmap_zscores.ipynb"
+    output:
+        "pipeline_activation/figures/zscaled-heatmap.pdf",
+        "pipeline_activation/figures/log-intensity-heatmap.pdf"
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule plot_heatmap_genesets:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/log_intensity_medians.tsv",
+        "pipeline_activation/model-output/global_map.h5",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_heatmap_genesets.ipynb"
+    output:
+        "pipeline_activation/figures/geneset-heatmap.GOBP_VESICLE_MEDIATED_TRANSPORT.pdf",
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+rule run_gsea_msigdb_collection:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        "pipeline_activation/model-output/global_map.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/write_gsea_table.py",
+    output:
+        "pipeline_activation/tables/gsea_result_table.{coef}.{gs_collection}.tsv"
+    params:
+        coef="{coef}",
+        gs_collection="{gs_collection}",
+    shell:
+        """
+        python {input.script:q} --outfile {output:q} --coef {params.coef} --collection {params.gs_collection}
+        """
+
+rule plot_gseaplot:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/model-output/pergene_hdis.h5",
+        "pipeline_activation/model-output/global_map.h5",
+        metadata="pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_gseaplot.py",
+    output:
+        "pipeline_activation/figures/gsea.{coef}.{gs_collection}.{geneset}.pdf"
+    params:
+        coef="{coef}",
+        gs_collection="{gs_collection}",
+        geneset="{geneset}",
+    shell:
+        """
+        python {input.script:q} --outfile {output:q} --coef {params.coef} --collection {params.gs_collection} --geneset {params.geneset}
+        """
+
+rule plot_pairplot_cl_ncl:
+    input:
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/raw/hgnc_metadata.tsv.gz",
+        OMNI_DB,
+        script="notebooks/manuscripts/biology-rbps-in-activation/scripts/plot_correlation_nCL_CL_abundance.ipynb"
+    output:
+        "pipeline_activation/figures/pairplot.fp_cl_ncl.pdf"
+    shell:
+        """
+        jupyter execute --inplace {input.script}
+        """
+
+
+######
+# "manuscript structure rules"
+######
+
+# unfortunately rules depending on other rules need to be defined last ...
+# documentation at:
+# https://snakemake.readthedocs.io/en/stable/snakefiles/rules.html#rule-dependencies
+# and
+# https://snakemake.readthedocs.io/en/stable/snakefiles/rules.html#target-rules
+
+# give figs a name rather than "1A" "1B" etc
+# TSV/Excel tables
+rule tables_gsea_geneset_collections:
+    input:
+        expand(
+            "pipeline_activation/tables/gsea_result_table.{coef}.{gs_collection}.tsv",
+            coef=[
+                'RBPness',
+                'act_deltaRBPness',
+                'activation',
+                'activation_FP',
+            ],
+            gs_collection=[
+                'C2_CP_REACTOME',
+                'C5_GO_MF',
+                'C5_GO_CC',
+                'C5_GO_BP',
+                'C2_CP_KEGG',
+                'C7_IMMUNESIGDB',
+            ],
+        )
+
+# Data files (for browser / R scripts)
+rule input_for_collaborators:
+    # for their R scripts
+    input:
+        "pipeline_activation/intensity-values.tsv",
+        "pipeline_activation/samplesheet.tsv",
+        "pipeline_activation/raw/observed-data.xlsx",
+        "pipeline_activation/model-output/oops_2022_model_output.xlsx",
+
+
+## Figure output renamer
+def final_figure_lookup_func(wildcards):
+    w = (
+        (FIGURE_MAPPING['suffix'] == wildcards.suffix)
+    )
+    assert w.sum() == 1
+    return FIGURE_MAPPING[w].iloc[0]['inpath']
+
+
+rule manuscript_figure_renamer:
+    input: final_figure_lookup_func
+    output: OUTDIR / "figures" / "Fig{suffix}"
+    shell:
+        """
+            cp {input} {output}
+        """
+
+rule manuscript_figures:
+    input:
+        FIGURE_MAPPING['outpath']
+
+
+# collect all figures in a meta "all" rule:
+rule all:
+    default_target: True
+    input:
+        rules.manuscript_figures.input,
+        rules.input_for_collaborators.input,
+        rules.tables_gsea_geneset_collections.input,
