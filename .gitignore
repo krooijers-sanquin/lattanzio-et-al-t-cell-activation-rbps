@@ -1,0 +1,4 @@
+**/.ipynb_checkpoints/
+.vscode/
+.snakemake/
+pipeline_activation/
