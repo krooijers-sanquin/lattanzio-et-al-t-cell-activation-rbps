@@ -12,15 +12,13 @@ OUTDIR = Path("pipeline_activation")
 # see, e.g.
 # ```bash
 # 
-# Ôò¡ÔöÇ­ƒƒóÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-# Ôò░ÔöÇ ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Reverse"
+# ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Reverse"
 #     55  Reverse
 #     53  Reverse
 #     53  Reverse
 #     53  Reverse
 
-# Ôò¡ÔöÇ­ƒƒóÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
-# Ôò░ÔöÇ ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Potential"
+# ls -1 data/raw/OOPS_valeria/evidence_tables/RES001700101.oops_*evidence_table.txt.gz | parallel -kj1 "gzip -dc {} | head -n1 | tr '\t' '\n' | nl | grep Potential"
 #     56  Potential contaminant
 #     54  Potential contaminant
 #     54  Potential contaminant
